@@ -1,0 +1,5 @@
+# Stable device node for the ESP32-C3 status display.
+# 303a:1001 = Espressif built-in USB Serial/JTAG (native USB on the ESP32-C3).
+# Creates /dev/claude-status. MODE 0666 = any local user can write it, so the
+# hook works with no group membership / re-login dance.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="claude-status", MODE="0666", GROUP="dialout"

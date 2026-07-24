@@ -1,0 +1,29 @@
+{
+  "_comment": "You normally don't touch this file by hand — `./install.sh` reads it, rewrites every command path to your checkout location, and merges the 'hooks' object into ~/.claude/settings.json for you. Shown here so you can see exactly what gets enabled. The paths below are placeholders; install.sh replaces them. 'async: true' keeps these side-effect-only hooks from ever adding latency to your session; drop it if your Claude Code version rejects it.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh work" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh work" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "", "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh work" } ] }
+    ],
+    "PermissionRequest": [
+      { "matcher": "", "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh perm" } ] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh notify" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh done" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh start" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh end" } ] }
+    ]
+  }
+}

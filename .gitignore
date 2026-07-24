@@ -1,0 +1,12 @@
+# PlatformIO build output
+.pio/
+
+# Local PlatformIO virtualenv (if created inside the repo)
+pio-venv/
+.venv/
+
+# Claude Code local, user-specific settings (never share these)
+.claude/settings.local.json
+
+# Settings backups the installer writes
+*.bak.*
