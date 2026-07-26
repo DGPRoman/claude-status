@@ -38,6 +38,11 @@ static const uint8_t       WORK_MIN_LVL  = 12;
 static const uint8_t       WORK_SPAN_LVL = 170;   // peak = MIN + SPAN
 static const uint8_t       START_LVL     = 100;   // steady medium
 static const unsigned long FLASH_MS      = 400;   // OLED invert-flash half-period
+static const unsigned long PERM_TIMEOUT_MS = 60000; // auto-calm a CONFIRM after this
+                                                  // long with no new attention, so a
+                                                  // missed clear-event (Ctrl+C, or the
+                                                  // dead VSCode Notification hook) can
+                                                  // never leave it blinking forever
 static const size_t        RX_MAX        = 120;   // serial line-buffer cap (protocol lines are short)
 static const unsigned long LOOP_MS       = 15;    // main-loop tick
 
@@ -56,6 +61,9 @@ static bool  dirty     = true;            // OLED redraw needed
 static bool  ack       = false;           // BOOT pressed -> calm the alert
 static bool  flashOn   = false;           // OLED invert-flash phase for perm
 static unsigned long lastFlash = 0;
+static unsigned long alarmStart = 0;       // millis() when the CURRENT active (un-acked)
+                                           // CONFIRM alarm began; used only for auto-calm
+static bool  alarmArmed = false;           // is a perm alarm currently counting toward calm?
 static bool  lastBtn   = HIGH;
 static String rx;
 
@@ -92,6 +100,24 @@ static uint8_t ledLevel(State s, unsigned long now) {
     case S_START: return START_LVL;
     default:      return 0;                 // done / idle / end / boot: off
   }
+}
+
+// --- CONFIRM alarm control -------------------------------------------------
+// A single pair of helpers owns both `ack` and the auto-calm timer so they can
+// never drift out of sync (the earlier bug: two separate code paths set the
+// timestamp, and an identical-resend path skipped it, so the failsafe fired
+// against a stale start time and the LED calmed almost immediately).
+//
+// armAlarm(): start (or restart) an urgent, un-acked CONFIRM and its 60s timer.
+// calmAlarm(): stop the urgency (BOOT press or the failsafe) — steady dim glow.
+static void armAlarm(unsigned long now) {
+  ack        = false;
+  alarmArmed = true;
+  alarmStart = now;
+}
+static void calmAlarm() {
+  ack        = true;
+  alarmArmed = false;
 }
 
 static void applyLed() {
@@ -162,7 +188,9 @@ static void handleLine(String line) {
   // ANY session fires a hook, so a stuck CONFIRM (e.g. after Ctrl+C, which fires
   // no hook to clear it) would otherwise get re-armed on every unrelated event.
   // Ignoring identical lines keeps a BOOT ack "sticky": once you calm the alert
-  // it stays calm until the state/count actually changes.
+  // it stays calm until the state/count actually changes. NOTE: this early return
+  // must NOT re-arm the alarm — an identical CONFIRM resend is not new attention, so
+  // its auto-calm timer keeps counting from the ORIGINAL arm, exactly as intended.
   if (newState == state && newCount == sessCount) return;
 
   // Re-arm the alert (drop a BOOT ack, restart the blink) only for genuinely NEW
@@ -173,7 +201,15 @@ static void handleLine(String line) {
 
   state = newState;
   sessCount = newCount;
-  if (reArm) ack = false;
+  if (newState == S_PERM) {
+    // Genuinely new attention (state change, or more sessions) (re)arms the alarm
+    // AND restarts its auto-calm timer. A non-re-arm change into/within perm (e.g.
+    // a count DECREASE) leaves an existing ack untouched — nothing new needs you.
+    if (reArm) armAlarm(millis());
+  } else {
+    // Left CONFIRM entirely: drop any pending alarm so it can't linger or re-fire.
+    alarmArmed = false;
+  }
   dirty = true;                // always redraw (the badge count may have changed)
 }
 
@@ -201,8 +237,19 @@ void loop() {
   }
 
   bool btn = digitalRead(PIN_BTN);
-  if (lastBtn == HIGH && btn == LOW) { ack = true; dirty = true; }  // press edge
+  if (lastBtn == HIGH && btn == LOW) { calmAlarm(); dirty = true; }  // press edge
   lastBtn = btn;
+
+  // Failsafe: auto-calm a CONFIRM that has been screaming too long. A missed
+  // clear-event (Ctrl+C fires no hook; the VSCode Notification hook is dead) must
+  // never strand the device in a forever-blink. This does what a BOOT press would
+  // — drops to the steady dim glow — but keeps state == S_PERM so the info stays.
+  // Gated on alarmArmed (not a bare timestamp) so it can ONLY fire against a timer
+  // that armAlarm() actually started this alarm — never a stale/zero start value.
+  if (alarmArmed && (millis() - alarmStart) > PERM_TIMEOUT_MS) {
+    calmAlarm();
+    dirty = true;
+  }
 
   if (millis() - lastFlash > FLASH_MS) {
     lastFlash = millis();

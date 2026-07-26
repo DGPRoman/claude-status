@@ -53,19 +53,19 @@ if [ -n "${CLAUDE_STATUS_DEBUG:-}" ]; then
     "$(printf '%s' "$sid_raw" | cut -c1-8)" "$msg_raw" >> "$DIR/events.log" 2>/dev/null || true
 fi
 
-# Resolve the Notification catch-all from its message. Permission prompts are
-# handled immediately by the PermissionRequest hook, so we IGNORE the (delayed,
-# ~5-7s) permission Notification here — otherwise it would re-raise CONFIRM after
-# you already answered. "waiting for input" -> idle; an EMPTY/absent message is
-# non-actionable -> idle (this also avoids a spurious CONFIRM when jq is missing);
-# any other message -> perm (best-effort attention).
+# Resolve the Notification catch-all from its message. CONFIRM must ONLY come from
+# the dedicated PermissionRequest hook, which fires instantly (0-2ms) and is the
+# single source of truth for "needs your permission". The Notification event is
+# noisy and delayed (permission notifications arrive ~5-7s late; other messages
+# are non-actionable status), so it must NEVER raise perm — doing so is what makes
+# CONFIRM blink for no reason. Mapping: "waiting for input" / empty / absent -> idle;
+# a permission message -> ignore (PermissionRequest already covered it, and it's
+# stale by now); ANY OTHER message -> idle too (informational, not an alert).
 if [ "$EVENT" = "notify" ]; then
   msg="$(printf '%s' "$msg_raw" | tr 'A-Z' 'a-z')"
   case "$msg" in
-    "")                                                      EVENT="idle" ;;
-    *"waiting for your input"*|*"waiting for input"*|*idle*) EVENT="idle" ;;
-    *permission*)                                            exit 0 ;;
-    *)                                                       EVENT="perm" ;;
+    *permission*) exit 0 ;;    # PermissionRequest owns CONFIRM; this is a stale echo
+    *)            EVENT="idle" ;;
   esac
 fi
 

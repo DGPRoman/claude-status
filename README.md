@@ -47,13 +47,15 @@ moment the approved tool finishes, the state flips `perm→work`. Without that h
 when a permission is answered).
 
 \* idle→READY goes through the catch-all `Notification` hook (`claude-status.sh
-notify` reads `.message`). Mapping: "waiting for input" (or an empty/absent
-message) → `idle`; a permission message → ignored (see below); **any other
-message → `perm`** as a best-effort attention fallback. This hook **does NOT fire
-in the native VSCode extension** — a known bug,
+notify` reads `.message`). Mapping: a permission message → **ignored** (see below);
+**every other message (including "waiting for input", empty, or absent) → `idle`**.
+The `Notification` event is deliberately **never** allowed to raise `CONFIRM`:
+`PermissionRequest` is the single source of truth for it (fires instantly, 0–2 ms),
+whereas `Notification` is noisy and the permission variant arrives ~5–7 s late — a
+notify→perm fallback used to re-raise CONFIRM for no reason. This hook **does NOT
+fire in the native VSCode extension** — a known bug,
 [#59718](https://github.com/anthropics/claude-code/issues/59718) (closed as a
-duplicate). The permission `Notification` is deliberately ignored (it arrives with
-a ~5–7 s delay) — `PermissionRequest` covers it instantly.
+duplicate).
 
 > **In the VSCode extension** everything critical works: WORK / DONE / START /
 > **CONFIRM**. Only the cosmetic idle→READY-after-idle does not (the dead
@@ -65,6 +67,10 @@ steady dim glow — and **stay** calm. Identical status resends (which the
 aggregator emits whenever any session fires a hook) no longer re-trigger the
 blink; only a genuinely new state, or *more* sessions entering the state,
 re-arms it. So an acknowledged CONFIRM won't start flashing again on its own.
+As a failsafe, a CONFIRM also **auto-calms itself after 60 s** (same steady dim as
+a BOOT press, state preserved) so a missed clear-event — `Ctrl+C`, which fires no
+hook, or the dead VSCode `Notification` — can never leave the device blinking
+forever (`PERM_TIMEOUT_MS` in `src/main.cpp`).
 
 ## Multiple sessions at once
 
