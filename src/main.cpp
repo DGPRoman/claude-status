@@ -14,6 +14,10 @@
 // COUNT is how many sessions share this state (badge shown when >=2).
 // The OLED shows a single big word. The BOOT button (GPIO9) acknowledges an
 // alert: the fast blink + screen flash calm down to a steady dim.
+//
+// Screen power: states with no LED activity (done/idle/end/boot) also power the
+// OLED fully DOWN, so an idle device is completely dark — no glow, no burn-in —
+// until Claude next needs you. WORK/CONFIRM/START wake the screen back on.
 
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -60,6 +64,7 @@ static int   sessCount = 1;               // sessions sharing the displayed stat
 static bool  dirty     = true;            // OLED redraw needed
 static bool  ack       = false;           // BOOT pressed -> calm the alert
 static bool  flashOn   = false;           // OLED invert-flash phase for perm
+static bool  oledOn    = true;            // OLED panel power (setPowerSave); off in quiescent states
 static unsigned long lastFlash = 0;
 static unsigned long alarmStart = 0;       // millis() when the CURRENT active (un-acked)
                                            // CONFIRM alarm began; used only for auto-calm
@@ -84,6 +89,13 @@ static const char* stateWord(State s) {
     case S_END:   return "IDLE";
     default:      return "claude";
   }
+}
+
+// Does this state light the screen? Mirrors the LED: WORK/CONFIRM/START are the
+// "something is happening / needs you" states; everything else leaves the OLED
+// powered down so an idle device is fully dark.
+static bool displayActive(State s) {
+  return s == S_WORK || s == S_PERM || s == S_START;
 }
 
 // perceived LED brightness 0..255 for the current state at time `now`
@@ -126,6 +138,14 @@ static void applyLed() {
 }
 
 static void draw() {
+  // Quiescent states (done/idle/end/boot) power the OLED fully down, so an idle
+  // device is completely dark — matching the LED, which is also off for these.
+  if (!displayActive(state)) {
+    if (oledOn) { u8g2.setPowerSave(1); oledOn = false; }
+    return;
+  }
+  if (!oledOn) { u8g2.setPowerSave(0); oledOn = true; }
+
   const char* w = stateWord(state);
   bool invert = (state == S_PERM && flashOn && !ack);   // full-screen flash
 
