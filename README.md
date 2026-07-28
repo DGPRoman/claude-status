@@ -103,11 +103,14 @@ actively-working session could be pruned mid-work. Session state lives in
 
 **PlatformIO** (recommended):
 ```bash
-pio run -t upload            # build & flash
+pio run -t upload            # build & flash the default USB-serial build
 pio device monitor           # (optional) watch the log
 ```
-If the board doesn't enter flashing mode automatically: hold **BOOT**, tap
-**RST**, release **BOOT**, then `pio run -t upload`.
+There are **two build targets** from the same source (see `platformio.ini`): the
+default `usb` (talks over USB-serial) and `wifi` (HTTP over your LAN — see
+[WiFi variant](#wifi-variant-wireless)). `pio run -t upload` uses `usb`; add
+`-e wifi` for the wireless build. If the board doesn't enter flashing mode
+automatically: hold **BOOT**, tap **RST**, release **BOOT**, then re-run.
 
 **Arduino IDE** (alternative): board `ESP32C3 Dev Module`, enable
 `USB CDC On Boot: Enabled`, library `U8g2`, copy `src/main.cpp` into a sketch.
@@ -210,7 +213,73 @@ offsets are needed. LED polarity is set by `LED_ACTIVE_LOW` in `src/main.cpp`.
   trace of what actually reaches the hook, set `CLAUDE_STATUS_DEBUG=1` and watch
   `$XDG_RUNTIME_DIR/claude-status/events.log`.
 
-## Want it wireless?
-The firmware can easily move to WiFi (the ESP32 serves an HTTP endpoint + mDNS
-`claude-status.local`, and the hook does a `curl`). Say the word and I'll add that
-variant.
+## WiFi variant (wireless)
+
+The same firmware can run over WiFi instead of USB-serial: the board serves an
+HTTP endpoint on your LAN (as `claude-status.local` via mDNS), and the hook
+`curl`s the state to it. The device only needs USB for **power** then — it can
+sit anywhere on the network. Everything on-screen (WORK / CONFIRM / off, the
+badge, the debugger) is identical; only the wire changes.
+
+### Build & flash the WiFi firmware
+```bash
+pio run -e wifi -t upload
+```
+(Uses the OTA-less `huge_app` partition, since the WiFi stack is large.)
+
+### Connecting to WiFi — and remembering networks
+The device behaves like a phone: it **remembers up to 5 networks** and auto-joins
+whichever is in range (via `WiFiMulti`).
+
+- **First boot** (or no known network in range): it opens a **captive portal** —
+  the OLED shows `SETUP` and the WiFi name `claude-setup`. Join that AP from a
+  phone/laptop, pick your network, enter the password. The device stores it and
+  reboots onto it.
+- **Add another network** (e.g. moving it to a new place) without losing the old
+  ones: **hold BOOT for ~2 s**. The portal opens again; the network you add is
+  *appended* — old ones are kept, so it still auto-joins them when you're back.
+- Remotely: `POST /reprovision` opens the portal; `POST /forget` clears all saved
+  networks (both need the token, below).
+
+On connect the OLED briefly shows the device's **IP** and `claude-status.local`,
+then goes dark as usual.
+
+### Point the hook at the device
+```bash
+./install.sh --wifi                       # URL defaults to http://claude-status.local/state
+./install.sh --wifi 'http://192.168.1.42/state'        # or a fixed IP
+./install.sh --wifi 'http://claude-status.local/state' <TOKEN>   # token by hand
+```
+This writes `~/.config/claude-status.conf` (`CLAUDE_STATUS_URL` +
+`CLAUDE_STATUS_TOKEN`) and merges the hooks. **No sudo, no udev rule** — the
+network path needs neither. If the board is plugged into the same machine over
+USB, `--wifi` **reads the token off the device automatically** (over serial); the
+human never has to type it. `./install.sh --test` then works over HTTP too.
+
+### Token (auth)
+Because an open HTTP endpoint on the LAN would let anyone drive the display, the
+device generates a **random token** on first boot and requires it on `POST /state`
+(as `?t=<token>` or an `X-Auth` header); other requests get `401`. Read it any
+time over USB with the serial debugger command `token`, or set your own with
+`token <value>`. It's also shown in `dump`.
+
+### HTTP protocol
+```bash
+TOKEN=...    # from `./install.sh --wifi` output, or the `token` debug command
+H='Content-Type: text/plain'
+curl -m1 -H "$H" --data-binary 'work|1' "http://claude-status.local/state?t=$TOKEN"
+curl -m1 -H "$H" --data-binary 'perm|2' "http://claude-status.local/state?t=$TOKEN"
+curl -m1 -H "$H" --data-binary 'off|1'  "http://claude-status.local/state?t=$TOKEN"
+# or, header-free, put the line in a ?m= query:
+curl -m1 -X POST "http://claude-status.local/state?t=$TOKEN&m=work|1"
+```
+The `text/plain` header matters: without it curl's default form content-type makes
+the device parse the body as a form field. The `?m=` query form sidesteps that.
+`GET http://claude-status.local/` returns a small status page (state, IP, known
+network names, firmware build) — a browser-side view of the device.
+
+> **Notes.** The endpoint is reachable by anyone on your LAN who has the token —
+> fine for a home/desk network; don't expose the device to the open internet.
+> `.local` resolution needs mDNS (avahi/`nss-mdns`, usually present on Ubuntu); if
+> it doesn't resolve, use the IP the OLED shows at connect and re-run `--wifi`
+> with `http://<IP>/state`.

@@ -14,9 +14,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${CLAUDE_STATUS_PORT:-/dev/claude-status}"
 SETTINGS="$HOME/.claude/settings.json"
 HOOK="$HERE/hooks/claude-status.sh"
+CONF="${CLAUDE_STATUS_CONF:-$HOME/.config/claude-status.conf}"   # WiFi transport config
 
 # ---- demo mode ------------------------------------------------------------
 if [ "${1:-}" = "--test" ]; then
+  # shellcheck source=/dev/null
+  [ -f "$CONF" ] && . "$CONF" 2>/dev/null || true
+  url="${CLAUDE_STATUS_URL:-}"; tok="${CLAUDE_STATUS_TOKEN:-}"
+  if [ -n "$url" ]; then
+    for s in "work|1" "work|3" "perm|1" "perm|2" "off|1"; do
+      echo "-> $s (HTTP)"; curl -sS -m 2 -H 'Content-Type: text/plain' --data-binary "$s" "$url${tok:+?t=$tok}" >/dev/null 2>&1 || true; sleep 1.5
+    done
+    echo "done."; exit 0
+  fi
   [ -e "$PORT" ] || { echo "No device at $PORT — plug it in / finish install first."; exit 1; }
   for s in "work|1" "work|3" "perm|1" "perm|2" "off|1"; do
     echo "-> $s"; printf '%s\n' "$s" > "$PORT"; sleep 1.5
@@ -84,6 +94,58 @@ if [ "${1:-}" = "--hooks" ]; then
   echo "Installing Claude Code hooks only"
   install_hooks
   jq '.hooks | keys' "$SETTINGS"
+  exit 0
+fi
+
+# ---- WiFi transport setup -------------------------------------------------
+#   ./install.sh --wifi [URL] [TOKEN]
+# Points the hook at a networked device instead of the serial port. URL defaults
+# to the mDNS name; TOKEN, if omitted, is read from the device over USB (the WiFi
+# firmware answers a `token` command on the same serial link). Writes $CONF and
+# merges the hooks. No sudo, no udev rule — the network path needs neither.
+if [ "${1:-}" = "--wifi" ]; then
+  URL="${2:-http://claude-status.local/state}"
+  TOKEN="${3:-}"
+
+  if [ -z "$TOKEN" ] && [ -e "$PORT" ]; then
+    echo "Reading auth token from the device at $PORT (USB) ..."
+    stty -F "$PORT" -hupcl clocal 115200 raw 2>/dev/null || true
+    tmpr="$(mktemp)"
+    ( timeout 4 cat "$PORT" > "$tmpr" 2>/dev/null ) &
+    rpid=$!
+    sleep 1
+    printf 'token\n' > "$PORT" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+    TOKEN="$(sed -n 's/^token=//p' "$tmpr" 2>/dev/null | tr -d '\r' | head -1)"
+    rm -f "$tmpr"
+    if [ -n "$TOKEN" ]; then
+      echo "   got token ${TOKEN:0:4}…"
+    else
+      echo "   !! couldn't read a token. Is this the WiFi firmware, plugged in via USB?"
+      echo "      You can pass it explicitly: ./install.sh --wifi '$URL' <TOKEN>"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$CONF")"
+  {
+    echo "# claude-status WiFi transport — written by install.sh --wifi"
+    echo "CLAUDE_STATUS_URL=\"$URL\""
+    if [ -n "$TOKEN" ]; then echo "CLAUDE_STATUS_TOKEN=\"$TOKEN\""; fi
+  } > "$CONF"
+  echo "   wrote $CONF"
+
+  install_hooks
+  jq '.hooks | keys' "$SETTINGS"
+  echo
+  echo "===================================================================="
+  echo "WiFi transport configured -> $URL"
+  echo "  * First-time / new network: hold BOOT ~2 s (or on first boot the device"
+  echo "    opens a setup portal) and join the WiFi named 'claude-setup', then pick"
+  echo "    your network. Old networks are remembered; it re-joins whichever is near."
+  echo "  * Smoke-test:  $HERE/install.sh --test"
+  echo "  * If claude-status.local doesn't resolve, use the IP the OLED shows:"
+  echo "      ./install.sh --wifi 'http://<IP>/state'"
+  echo "===================================================================="
   exit 0
 fi
 
