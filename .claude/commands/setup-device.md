@@ -44,14 +44,15 @@ machine for the current user. Be concise and act — this is a routine install.
    lsusb | grep 303a                 # 303a:1001 present
    jq '.hooks | keys' ~/.claude/settings.json
    ```
-   The hooks list must contain all 8 events: Notification, PermissionRequest,
-   PostToolUse, PreToolUse, SessionEnd, SessionStart, Stop, UserPromptSubmit.
+   The hooks list must contain all 7 events: Notification, PermissionRequest,
+   PostToolUse, PreToolUse, SessionEnd, Stop, UserPromptSubmit.
 
 3. Smoke-test the display (only if the device node exists):
    ```bash
    ./install.sh --test
    ```
-   Ask the user to confirm the OLED cycles START → WORK → CONFIRM → DONE → READY.
+   Ask the user to confirm the OLED shows WORK, then WORK with a "3" badge, then
+   CONFIRM, then CONFIRM with a "2" badge, then goes dark (off).
 
 4. Report the result. If the port never appears or the test fails, diagnose using
    the **Troubleshooting** section of `README.md` (check `lsusb | grep 303a`, replug

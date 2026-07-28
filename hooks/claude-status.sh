@@ -3,25 +3,28 @@
 # concurrent sessions.
 #
 # Usage (from settings.json):  claude-status.sh <event>
-#   event = work | perm | done | idle | start | end | notify
+#   event = work | perm | off | end | notify
+# Only three states reach the device: work (Claude is doing something), perm (needs
+# YOUR action), and off (idle / finished / not running -> screen + LED dark). `end`
+# is a control event (prune this session on SessionEnd); `notify` is the catch-all
+# for the Notification hook (mapped to off, except permission messages, which are
+# ignored so they can't clobber a CONFIRM that PermissionRequest already raised).
 #
 # The event payload (with .session_id, and for notifications .message) arrives
-# as JSON on STDIN. "notify" is a catch-all for the Notification hook: we read
-# the message and map it to idle (Claude is just waiting) or perm (something that
-# actually needs your attention).
+# as JSON on STDIN.
 #
 # Each session's current state is stored in its own file; on every event we pick
 # the HIGHEST-PRIORITY state across all live sessions and count how many sessions
 # share it, then send "state|count\n" to the device. So a CONFIRM in one session
-# is never clobbered by WORK/DONE in another, and the display shows how many
-# sessions are in the winning state.
+# is never clobbered by WORK in another, and the display shows how many sessions
+# are in the winning state.
 #
-# Priority: perm > work > done > start > idle. Stale sessions (no update within
-# TTL) are pruned; SessionEnd removes a session immediately.
+# Priority: perm > work > off. Stale sessions (no update within TTL) are pruned;
+# SessionEnd removes a session immediately.
 #
 # Design rule: never block or fail the Claude session — every path exits 0.
 
-EVENT="${1:-idle}"
+EVENT="${1:-off}"
 PORT="${CLAUDE_STATUS_PORT:-/dev/claude-status}"
 # Seconds until a silent session is treated as dead and pruned. Must exceed your
 # longest single tool call: a session's file mtime only advances on a hook event,
@@ -58,14 +61,13 @@ fi
 # single source of truth for "needs your permission". The Notification event is
 # noisy and delayed (permission notifications arrive ~5-7s late; other messages
 # are non-actionable status), so it must NEVER raise perm — doing so is what makes
-# CONFIRM blink for no reason. Mapping: "waiting for input" / empty / absent -> idle;
-# a permission message -> ignore (PermissionRequest already covered it, and it's
-# stale by now); ANY OTHER message -> idle too (informational, not an alert).
+# CONFIRM blink for no reason. Mapping: a permission message -> ignore (would clobber
+# the real CONFIRM); ANY OTHER message (waiting for input / empty / absent) -> off.
 if [ "$EVENT" = "notify" ]; then
   msg="$(printf '%s' "$msg_raw" | tr 'A-Z' 'a-z')"
   case "$msg" in
     *permission*) exit 0 ;;    # PermissionRequest owns CONFIRM; this is a stale echo
-    *)            EVENT="idle" ;;
+    *)            EVENT="off" ;;
   esac
 fi
 
@@ -87,12 +89,10 @@ fi
 # priority of a state as a bare number (higher wins); 0 = unknown/ignored
 prio() {
   case "$1" in
-    perm)  echo 5 ;;
-    work)  echo 4 ;;
-    done)  echo 3 ;;
-    start) echo 2 ;;
-    idle)  echo 1 ;;
-    *)     echo 0 ;;
+    perm) echo 3 ;;
+    work) echo 2 ;;
+    off)  echo 1 ;;
+    *)    echo 0 ;;    # legacy done/idle/start files: ignored, treated as no-state
   esac
 }
 
@@ -102,7 +102,7 @@ prio() {
 exec 9>"$DIR/.lock" 2>/dev/null
 if flock -w 2 9 2>/dev/null; then
   now="$(date +%s)"
-  best="idle"; bestp=0; count=0
+  best="off"; bestp=0; count=0
   for f in "$DIR"/*; do
     [ -f "$f" ] || continue
     case "${f##*/}" in events.log|.lock) continue ;; esac  # not session-state files
@@ -118,7 +118,9 @@ if flock -w 2 9 2>/dev/null; then
       count="$((count + 1))"
     fi
   done
-  [ "$bestp" -eq 0 ] && { best="idle"; count=0; }
+  # No live sessions (or only legacy/ignored files): go dark. COUNT floors at 1 on
+  # the wire (the documented protocol; off draws no badge anyway, so it's cosmetic).
+  [ "$bestp" -eq 0 ] && { best="off"; count=1; }
 
   # Send to the device. `clocal` so open() never waits on carrier, and `timeout`
   # so a hung/non-draining device can never block the hook (and thus the session)

@@ -27,60 +27,58 @@ Done.
 
 ## States
 
-The LED is single-color, so status is encoded by **blink pattern** (not color):
+Just **three** states — the whole point is: *is Claude doing something, does it
+need me, or can I ignore it?* The LED is single-color, so it uses a blink pattern,
+not color:
 
-| State | Trigger (Claude Code hook)                      | LED                 | OLED      |
-|-------|-------------------------------------------------|---------------------|-----------|
-| work  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | smooth breathing    | `WORK`    |
-| perm  | `PermissionRequest`                             | **fast blink**      | `CONFIRM` |
-| idle  | `Notification` ("waiting for input")\*          | off                 | `READY`   |
-| done  | `Stop`                                          | off                 | `DONE`    |
-| start | `SessionStart`                                  | steady medium glow  | `START`   |
-| end   | `SessionEnd`                                    | off                 | `IDLE`    |
+| State  | Meaning                        | Trigger (Claude Code hook)                      | LED              | OLED       |
+|--------|--------------------------------|-------------------------------------------------|------------------|------------|
+| `work` | Claude is doing something      | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | smooth breathing | `WORK`     |
+| `perm` | needs **your** action          | `PermissionRequest`                             | **fast pulse**   | `CONFIRM`  |
+| `off`  | idle / finished / not running  | `Stop`, `Notification`\*, `SessionEnd`          | off              | off (dark) |
+
+`off` powers the **OLED and LED fully down** — an idle or finished device is
+completely dark (no glow, no burn-in) until Claude next works or needs you. Only
+`work` and `perm` light anything up. That's deliberate: light on the desk = "pay
+attention"; dark = "nothing for you right now".
 
 `CONFIRM` is driven by the **`PermissionRequest`** hook: it fires instantly
-(0–2 ms) right before the permission dialog is shown and **works both in the
-terminal and in the native VSCode extension** (verified empirically via
-`events.log`). **`PostToolUse`** (also → `work`) is what **clears** CONFIRM: the
-moment the approved tool finishes, the state flips `perm→work`. Without that hook
-`perm` would linger until the next tool call (Claude Code fires no dedicated event
-when a permission is answered).
+(0–2 ms) right before the permission dialog and **works both in the terminal and
+in the native VSCode extension** (verified empirically). **`PostToolUse`** (→
+`work`) is what **clears** it: the moment the approved tool runs, the state flips
+`perm→work`. Without that hook `perm` would linger until the next tool call
+(Claude Code fires no dedicated event when a permission is answered).
 
-\* idle→READY goes through the catch-all `Notification` hook (`claude-status.sh
-notify` reads `.message`). Mapping: a permission message → **ignored** (see below);
-**every other message (including "waiting for input", empty, or absent) → `idle`**.
-The `Notification` event is deliberately **never** allowed to raise `CONFIRM`:
-`PermissionRequest` is the single source of truth for it (fires instantly, 0–2 ms),
-whereas `Notification` is noisy and the permission variant arrives ~5–7 s late — a
-notify→perm fallback used to re-raise CONFIRM for no reason. This hook **does NOT
-fire in the native VSCode extension** — a known bug,
-[#59718](https://github.com/anthropics/claude-code/issues/59718) (closed as a
-duplicate).
+For `CONFIRM` the LED pulses and the OLED blinks a full-screen invert **in
+lockstep** — both driven by the same ~4 Hz phase, starting deterministically at
+the same instant the alert arms. The **BOOT** button (GPIO9) acknowledges it: the
+pulse calms to a steady dim glow — and **stays** calm. Identical status resends
+(which the aggregator emits whenever any session fires a hook) don't re-trigger it;
+only a genuinely new CONFIRM, or *more* sessions needing you, re-arms it. As a
+failsafe, a CONFIRM also **auto-calms after 60 s** (same steady dim, state
+preserved) so a missed clear-event — e.g. `Ctrl+C`, which fires no hook — can never
+leave the device blinking forever (`PERM_TIMEOUT_MS` in `src/main.cpp`).
 
-> **In the VSCode extension** everything critical works: WORK / DONE / START /
-> **CONFIRM**. Only the cosmetic idle→READY-after-idle does not (the dead
-> `Notification`). You do **not** need a terminal for it.
+\* `Notification` maps to `off`, **except** a *permission* message, which is
+**ignored**: `PermissionRequest` is the single source of truth for `CONFIRM`
+(instant, 0–2 ms), whereas the `Notification` permission variant arrives ~5–7 s
+late and would re-raise a stale alert. The `Notification` hook also **does not fire
+in the native VSCode extension** ([bug
+#59718](https://github.com/anthropics/claude-code/issues/59718)) — harmless here,
+since it only ever means `off`, which is also where `Stop` and an idle session land.
 
-For `CONFIRM` the OLED also blinks a full-screen invert. The **BOOT** button
-(GPIO9) acknowledges the alert: the fast blink + screen flash calm down to a
-steady dim glow — and **stay** calm. Identical status resends (which the
-aggregator emits whenever any session fires a hook) no longer re-trigger the
-blink; only a genuinely new state, or *more* sessions entering the state,
-re-arms it. So an acknowledged CONFIRM won't start flashing again on its own.
-As a failsafe, a CONFIRM also **auto-calms itself after 60 s** (same steady dim as
-a BOOT press, state preserved) so a missed clear-event — `Ctrl+C`, which fires no
-hook, or the dead VSCode `Notification` — can never leave the device blinking
-forever (`PERM_TIMEOUT_MS` in `src/main.cpp`).
+> **In the VSCode extension** the two states that matter — **WORK** and
+> **CONFIRM** — both work. You do **not** need a terminal.
 
 ## Multiple sessions at once
 
 All sessions write to one device, but `claude-status.sh` acts as an
 **aggregator**: each session's state (keyed by `session_id` from the payload) is
 stored separately, and the display shows the **most urgent** state across all live
-sessions by priority `perm > work > done > start > idle`. So a `CONFIRM` in one
-session is **never clobbered** by `WORK` in another. A corner badge on the OLED
-shows the **count** of sessions in that state (for active states, ≥2): e.g. `WORK`
-+ `3` = three sessions working, `CONFIRM` + `2` = two waiting for confirmation.
+sessions by priority `perm > work > off`. So a `CONFIRM` in one session is **never
+clobbered** by `WORK` in another. A corner badge on the OLED shows the **count** of
+sessions in that state (`WORK` or `CONFIRM`) when ≥2: e.g. `WORK` + `3` = three
+sessions working, `CONFIRM` + `2` = two waiting for confirmation.
 
 `SessionEnd` removes a session immediately; stale ones (no update for more than
 `CLAUDE_STATUS_TTL`, default 3600 s) are pruned automatically. The default is
@@ -134,13 +132,41 @@ backed up. To re-merge only the hooks (no sudo): `./install.sh --hooks`.
 Done. The next prompt in any **new** Claude Code session will light the device up.
 
 ## Protocol (for manual testing)
-One line = one update: `STATE|COUNT` (session count; 1 = no badge). Written
-straight to the port, bypassing the aggregator:
+One line = one update: `STATE|COUNT` where `STATE` is `work` / `perm` / `off`
+(session count; 1 = no badge). Written straight to the port, bypassing the
+aggregator:
 ```bash
-printf 'perm|2\n' > /dev/claude-status   # fast blink + flash, badge "2"
+printf 'perm|2\n' > /dev/claude-status   # CONFIRM pulsing, badge "2"
 printf 'work|1\n' > /dev/claude-status   # smooth breathing
-printf 'idle|1\n' > /dev/claude-status   # off
+printf 'off|1\n'  > /dev/claude-status   # screen + LED dark
 ```
+
+## Serial debugger (see the screen without eyes on it)
+The firmware answers a few plain-text commands on the same USB link, so you can
+inspect exactly what's displayed and why — handy for debugging remotely (e.g. by
+Claude) when nobody is looking at the device:
+
+| Command                  | Response                                                            |
+|--------------------------|--------------------------------------------------------------------|
+| `dump` / `screen` / `?`  | full internal state **+ the live OLED framebuffer as 72×40 ASCII** (`#`=lit) |
+| `stat` / `status`        | the state header only (no framebuffer)                             |
+
+The header reports `state` (wire token + display word + enum), `count`, `ack`,
+`alarmArmed`, `alarm_rem`, `perm_high` (pulse phase), `panel` (ON / OFF-dark), `led_level`,
+`last_line`, `lines_rx`, and the firmware build timestamp. Debug commands never
+change what's displayed.
+
+Read a dump back (one shell invocation, so no hook perturbs the state mid-read):
+```bash
+PORT=/dev/claude-status
+stty -F "$PORT" -hupcl clocal 115200 raw
+timeout 4 cat "$PORT" > /tmp/dbg.out &      # attach a reader first
+printf 'perm|2\n' > "$PORT"                 # drive a known state (optional)
+printf 'dump\n'   > "$PORT"                 # ask the device to show the screen
+wait; cat /tmp/dbg.out
+```
+> When `panel` is `OFF`, the framebuffer shown is the **last** frame drawn before
+> the panel powered down — the device is physically dark. The header says so.
 
 ## Board pinout (verified)
 
@@ -168,8 +194,8 @@ offsets are needed. LED polarity is set by `LED_ACTIVE_LOW` in `src/main.cpp`.
   `/dev/claude-status` exists with `crw-rw-rw-` permissions (reinstall the rule and
   replug the board).
 - **LED doesn't react / stays lit** — a constant red is the power indicator (not
-  controllable). If states are inverted (DONE dark, READY lit), flip
-  `LED_ACTIVE_LOW` in `src/main.cpp`.
+  controllable). If the status LED is inverted (dark during `work`, lit when
+  `off`), flip `LED_ACTIVE_LOW` in `src/main.cpp`.
 - **Board resets on every update** — some hosts toggle DTR when opening the port.
   The script already sets `stty -hupcl`; if that doesn't help, keep the port open
   with a background reader: `cat /dev/claude-status &`.
