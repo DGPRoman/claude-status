@@ -18,17 +18,18 @@ HOOK="$HERE/hooks/claude-status.sh"
 # ---- demo mode ------------------------------------------------------------
 if [ "${1:-}" = "--test" ]; then
   [ -e "$PORT" ] || { echo "No device at $PORT — plug it in / finish install first."; exit 1; }
-  for s in "start|1" "work|1" "perm|1" "done|1" "idle|1"; do
+  for s in "work|1" "work|3" "perm|1" "perm|2" "off|1"; do
     echo "-> $s"; printf '%s\n' "$s" > "$PORT"; sleep 1.5
   done
   echo "done."; exit 0
 fi
 
 # ---- merge our hooks into ~/.claude/settings.json -------------------------
-# Per-event merge that PRESERVES the user's other hooks: for each of our 8 event
-# keys we keep every existing entry that isn't ours, drop any previous
-# claude-status entry (so re-running is idempotent), then append ours. Commands
-# are rewritten to THIS checkout and shell-quoted (so a path with spaces works).
+# Merge that PRESERVES the user's other hooks and fully OWNS ours: first strip
+# every claude-status entry from ALL existing event keys (so keys we no longer use
+# — e.g. a removed SessionStart — are cleaned up, and re-running is idempotent),
+# then append our current entries for each event key in the snippet. Commands are
+# rewritten to THIS checkout and shell-quoted (so a path with spaces works).
 install_hooks() {
   command -v jq >/dev/null 2>&1 || { echo "!! jq is required to merge hooks — install it, then re-run: ./install.sh --hooks" >&2; return 1; }
   chmod +x "$HOOK" 2>/dev/null || true       # both entry points guarantee +x
@@ -60,13 +61,18 @@ install_hooks() {
 
   jq --slurpfile ours "$tmp_ours" '
     .hooks = (.hooks // {})
+    # 1) strip OUR entries from every existing event key, then drop emptied keys.
+    #    This cleans up any event we no longer wire (e.g. a removed SessionStart)
+    #    while leaving the user'"'"'s foreign hooks untouched.
+    | .hooks |= (
+        with_entries(.value |= map(select(
+          [.hooks[]?.command // ""] | any(test("/hooks/claude-status\\.sh")) | not
+        )))
+        | with_entries(select(.value | length > 0))
+      )
+    # 2) append our current entries for each event key in the snippet.
     | reduce ($ours[0] | keys[]) as $k (.;
-        .hooks[$k] = (
-          ((.hooks[$k] // []) | map(select(
-            [.hooks[]?.command // ""] | any(test("/hooks/claude-status\\.sh")) | not
-          )))
-          + $ours[0][$k]
-        )
+        .hooks[$k] = ((.hooks[$k] // []) + $ours[0][$k])
       )
   ' "$SETTINGS" > "$tmp_out" || { echo "!! merge failed" >&2; return 1; }
 

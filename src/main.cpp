@@ -4,20 +4,17 @@
 //   - SINGLE-COLOR LED on GPIO8 (active-LOW) — NOT an RGB WS2812.
 //     Status is conveyed by BLINK PATTERN, not color.
 //
-// Protocol over USB-serial, one line per update:  STATE|COUNT\n
-//   work  -> slow breathing pulse     Claude is working
-//   perm  -> fast urgent blink        needs your permission/confirmation
-//   done  -> off                      finished responding
-//   idle  -> off                      waiting for your next prompt
-//   start -> steady medium            session started
-//   end   -> off                      session ended
-// COUNT is how many sessions share this state (badge shown when >=2).
-// The OLED shows a single big word. The BOOT button (GPIO9) acknowledges an
-// alert: the fast blink + screen flash calm down to a steady dim.
+// Just three states, matching what you actually care about:
+//   work -> screen "WORK", LED breathing        Claude is doing something
+//   perm -> screen "CONFIRM" pulsing, LED blink  needs YOUR action (so you notice)
+//   off  -> screen + LED fully OFF (dark)        idle / finished / not running
 //
-// Screen power: states with no LED activity (done/idle/end/boot) also power the
-// OLED fully DOWN, so an idle device is completely dark — no glow, no burn-in —
-// until Claude next needs you. WORK/CONFIRM/START wake the screen back on.
+// Protocol over USB-serial, one line per update:  STATE|COUNT\n
+// STATE is work | perm | off (any unknown token is treated as off). COUNT is how
+// many sessions share this state (a small badge is shown when >=2). The OLED shows
+// a single big word only for work/perm; off powers the panel fully DOWN so an idle
+// device is completely dark — no glow, no burn-in. The BOOT button (GPIO9)
+// acknowledges a CONFIRM: the pulse calms to a steady dim (and stays calm).
 
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -35,13 +32,13 @@ static const int     LED_FREQ = 2000;       // Hz
 static const int     LED_BITS = 8;          // -> duty 0..255
 
 // ---- animation timing / levels (ms, 0..255) ------------------------------
-static const unsigned long PERM_BLINK_MS = 240;   // full urgent-blink cycle (~4 Hz)
+static const unsigned long PERM_BLINK_MS = 240;   // full CONFIRM pulse cycle (~4 Hz).
+                                                  // Drives BOTH the LED blink and the
+                                                  // OLED invert, so they pulse in lockstep.
 static const uint8_t       PERM_ACK_LVL  = 40;    // dim glow after BOOT ack
 static const unsigned long WORK_BREATH_MS = 1800; // breathing cycle
 static const uint8_t       WORK_MIN_LVL  = 12;
 static const uint8_t       WORK_SPAN_LVL = 170;   // peak = MIN + SPAN
-static const uint8_t       START_LVL     = 100;   // steady medium
-static const unsigned long FLASH_MS      = 400;   // OLED invert-flash half-period
 static const unsigned long PERM_TIMEOUT_MS = 60000; // auto-calm a CONFIRM after this
                                                   // long with no new attention, so a
                                                   // missed clear-event (Ctrl+C, or the
@@ -57,20 +54,24 @@ static const int TEXT_MARGIN = 2;                 // px slack when fitting the w
 static const int BADGE_Y     = 9;                 // baseline (px) of the top-right count badge
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
 
-enum State { S_BOOT, S_WORK, S_PERM, S_DONE, S_IDLE, S_START, S_END };
+enum State { S_OFF, S_WORK, S_PERM };
 
-static State state     = S_BOOT;
+static State state     = S_OFF;           // start dark until Claude does something
 static int   sessCount = 1;               // sessions sharing the displayed state
 static bool  dirty     = true;            // OLED redraw needed
 static bool  ack       = false;           // BOOT pressed -> calm the alert
-static bool  flashOn   = false;           // OLED invert-flash phase for perm
-static bool  oledOn    = true;            // OLED panel power (setPowerSave); off in quiescent states
-static unsigned long lastFlash = 0;
-static unsigned long alarmStart = 0;       // millis() when the CURRENT active (un-acked)
-                                           // CONFIRM alarm began; used only for auto-calm
+static bool  permHigh  = false;           // current CONFIRM pulse phase (LED bright + screen inverted)
+static bool  lastPermHigh = false;        // previous tick's permHigh (to redraw only on an edge)
+static bool  oledOn    = true;            // OLED panel power (setPowerSave); off in the off state
+static unsigned long alarmStart = 0;       // millis() when the CURRENT active (un-acked) CONFIRM
+                                           // began; the pulse phase origin AND the auto-calm start
 static bool  alarmArmed = false;           // is a perm alarm currently counting toward calm?
 static bool  lastBtn   = HIGH;
 static String rx;
+
+// --- debugger bookkeeping --------------------------------------------------
+static String        lastLine  = "";   // last protocol line actually handled
+static unsigned long lineCount = 0;     // protocol lines received since boot
 
 // Fonts to try, largest first; pick the biggest whose word fits the width.
 static const uint8_t* const FONTS[] = {
@@ -83,34 +84,40 @@ static const char* stateWord(State s) {
   switch (s) {
     case S_WORK:  return "WORK";
     case S_PERM:  return "CONFIRM";
-    case S_DONE:  return "DONE";
-    case S_IDLE:  return "READY";
-    case S_START: return "START";
-    case S_END:   return "IDLE";
-    default:      return "claude";
+    default:      return "off";             // never rendered (panel is dark); debug-only
   }
 }
 
-// Does this state light the screen? Mirrors the LED: WORK/CONFIRM/START are the
-// "something is happening / needs you" states; everything else leaves the OLED
-// powered down so an idle device is fully dark.
-static bool displayActive(State s) {
-  return s == S_WORK || s == S_PERM || s == S_START;
+// The wire token that maps to this state (inverse of parseState). Used only by
+// the debugger so its readout matches the protocol word the host actually sent.
+static const char* wireToken(State s) {
+  switch (s) {
+    case S_WORK:  return "work";
+    case S_PERM:  return "perm";
+    default:      return "off";
+  }
 }
 
-// perceived LED brightness 0..255 for the current state at time `now`
+// Does this state light the screen (and the LED)? Only work/perm; off is dark.
+static bool displayActive(State s) {
+  return s == S_WORK || s == S_PERM;
+}
+
+// perceived LED brightness 0..255 for the current state at time `now`. The CONFIRM
+// blink phase is measured from alarmStart (not raw millis()) so the pulse begins
+// deterministically at the bright peak the instant the alarm arms, and stays in
+// lockstep with the OLED invert (which reads the same permHigh phase).
 static uint8_t ledLevel(State s, unsigned long now) {
   switch (s) {
     case S_PERM:
       if (ack) return PERM_ACK_LVL;
-      return (now % PERM_BLINK_MS < PERM_BLINK_MS / 2) ? 255 : 0;
+      return (((now - alarmStart) % PERM_BLINK_MS) < PERM_BLINK_MS / 2) ? 255 : 0;
     case S_WORK: {
       unsigned long t  = now % WORK_BREATH_MS;
       unsigned long up = (t < WORK_BREATH_MS / 2) ? t : (WORK_BREATH_MS - t);
       return (uint8_t)(WORK_MIN_LVL + up * WORK_SPAN_LVL / (WORK_BREATH_MS / 2));
     }
-    case S_START: return START_LVL;
-    default:      return 0;                 // done / idle / end / boot: off
+    default:      return 0;                 // off
   }
 }
 
@@ -125,21 +132,23 @@ static uint8_t ledLevel(State s, unsigned long now) {
 static void armAlarm(unsigned long now) {
   ack        = false;
   alarmArmed = true;
-  alarmStart = now;
+  alarmStart = now;                 // also the pulse phase origin: the blink starts
+                                    // at its bright peak here, so every fresh CONFIRM
+                                    // begins in the same deterministic phase.
 }
 static void calmAlarm() {
   ack        = true;
   alarmArmed = false;
 }
 
-static void applyLed() {
-  uint8_t b = ledLevel(state, millis());
+static void applyLed(unsigned long now) {
+  uint8_t b = ledLevel(state, now);
   ledcWrite(LED_CH, LED_ACTIVE_LOW ? (255 - b) : b);
 }
 
 static void draw() {
-  // Quiescent states (done/idle/end/boot) power the OLED fully down, so an idle
-  // device is completely dark — matching the LED, which is also off for these.
+  // The off state powers the OLED fully down, so an idle device is completely dark
+  // — matching the LED, which is also off there.
   if (!displayActive(state)) {
     if (oledOn) { u8g2.setPowerSave(1); oledOn = false; }
     return;
@@ -147,7 +156,7 @@ static void draw() {
   if (!oledOn) { u8g2.setPowerSave(0); oledOn = true; }
 
   const char* w = stateWord(state);
-  bool invert = (state == S_PERM && flashOn && !ack);   // full-screen flash
+  bool invert = permHigh;   // full-screen invert, in lockstep with the LED blink
 
   u8g2.clearBuffer();
   if (invert) u8g2.drawBox(0, 0, OLED_W, OLED_H);
@@ -168,8 +177,9 @@ static void draw() {
   int y    = asc + (OLED_H - (asc - desc)) / 2;
   u8g2.drawStr(x, y, w);
 
-  // session-count badge (top-right) for active states shared by >1 session
-  if (sessCount >= 2 && (state == S_WORK || state == S_PERM || state == S_DONE)) {
+  // session-count badge (top-right) when >1 session shares this on-screen state.
+  // draw() has already returned for the off state, so any rendered state qualifies.
+  if (sessCount >= 2) {
     u8g2.setFont(u8g2_font_6x10_tr);
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", sessCount);
@@ -181,20 +191,77 @@ static void draw() {
   u8g2.sendBuffer();
 }
 
+// --- serial debugger -------------------------------------------------------
+// Lets a host "see" the device without eyes on it: dumps the internal logic
+// state AND the real OLED framebuffer as ASCII art (72x40, '#'=lit pixel). This
+// is the exact buffer last handed to the panel, so it shows precisely what is
+// (or, when the panel is powered down, what was last) rendered — including the
+// CONFIRM invert-flash and the session-count badge. Triggered by a plain serial
+// line (never a STATE|COUNT update), so it can't perturb the displayed state.
+//   dump | screen | ?   -> full state header + framebuffer
+//   stat | status       -> state header only
+static void printDebug(bool withFrame) {
+  unsigned long now = millis();
+  Serial.println();
+  Serial.println(F("=== claude-status debug ==="));
+  Serial.print(F("fw        : ")); Serial.println(F(__DATE__ " " __TIME__));
+  Serial.print(F("uptime_ms : ")); Serial.println(now);
+  Serial.print(F("state     : wire=")); Serial.print(wireToken(state));
+  Serial.print(F(" word="));            Serial.print(stateWord(state));
+  Serial.print(F(" enum="));            Serial.println((int)state);
+  Serial.print(F("count     : ")); Serial.println(sessCount);
+  Serial.print(F("ack       : ")); Serial.println(ack ? F("true") : F("false"));
+  Serial.print(F("alarmArmed: ")); Serial.println(alarmArmed ? F("true") : F("false"));
+  if (alarmArmed) {
+    long rem = (long)PERM_TIMEOUT_MS - (long)(now - alarmStart);
+    Serial.print(F("alarm_rem : ")); Serial.print(rem < 0 ? 0 : rem);
+    Serial.println(F(" ms"));
+  }
+  Serial.print(F("perm_high : ")); Serial.println(permHigh ? F("true") : F("false"));
+  Serial.print(F("panel     : ")); Serial.println(oledOn ? F("ON") : F("OFF (physically dark)"));
+  Serial.print(F("led_level : ")); Serial.println(ledLevel(state, now));
+  Serial.print(F("last_line : ")); Serial.println(lastLine.length() ? lastLine : String(F("(none)")));
+  Serial.print(F("lines_rx  : ")); Serial.println(lineCount);
+  if (withFrame) {
+    Serial.print(F("screen    : 72x40 ('#'=lit, '.'=dark"));
+    Serial.println(oledOn ? F(")") : F("; panel powered down, so nothing is physically visible)"));
+    const uint8_t* p = u8g2.getBufferPtr();
+    const int      stride = u8g2.getBufferTileWidth() * 8;   // bytes per tile row (== 72 here)
+    char row[OLED_W + 1];
+    row[OLED_W] = '\0';
+    for (int y = 0; y < OLED_H; y++) {
+      const uint8_t* base = p + (size_t)(y >> 3) * stride;   // tile row for this y
+      const uint8_t  bit  = y & 7;                           // LSB = topmost pixel of the tile
+      for (int x = 0; x < OLED_W; x++)
+        row[x] = ((base[x] >> bit) & 1) ? '#' : '.';
+      Serial.println(row);
+    }
+  }
+  Serial.println(F("=== end ==="));
+  Serial.flush();
+}
+
 static State parseState(const String& s) {
-  if (s == "work")  return S_WORK;
-  if (s == "perm")  return S_PERM;
-  if (s == "done")  return S_DONE;
-  if (s == "idle")  return S_IDLE;
-  if (s == "start") return S_START;
-  if (s == "end")   return S_END;
-  return S_IDLE;
+  if (s == "work") return S_WORK;
+  if (s == "perm") return S_PERM;
+  return S_OFF;                   // "off" and any unknown/legacy token -> dark
 }
 
 // Parse one protocol line: "STATE|COUNT" (COUNT optional).
 static void handleLine(String line) {
   line.trim();
   if (!line.length()) return;
+
+  // Debug commands (bidirectional inspection over the same link). Handled before
+  // any state parsing so they never change what's displayed. Case-insensitive.
+  String low = line;
+  low.toLowerCase();
+  if (low == "dump" || low == "screen" || low == "?") { printDebug(true);  return; }
+  if (low == "stat" || low == "status")               { printDebug(false); return; }
+
+  lastLine = line;
+  lineCount++;
+
   int bar = line.indexOf('|');
   String st = (bar >= 0) ? line.substring(0, bar) : line;
   String ct = (bar >= 0) ? line.substring(bar + 1) : "";
@@ -240,7 +307,7 @@ void setup() {
   u8g2.setContrast(255);
   ledcSetup(LED_CH, LED_FREQ, LED_BITS);
   ledcAttachPin(PIN_LED, LED_CH);
-  applyLed();
+  applyLed(millis());
   pinMode(PIN_BTN, INPUT_PULLUP);
   draw();
 }
@@ -256,6 +323,10 @@ void loop() {
     }
   }
 
+  // One timestamp for the whole tick, read AFTER serial handling so a just-armed
+  // alarm's phase origin is never in the future (which would corrupt the modulo).
+  unsigned long now = millis();
+
   bool btn = digitalRead(PIN_BTN);
   if (lastBtn == HIGH && btn == LOW) { calmAlarm(); dirty = true; }  // press edge
   lastBtn = btn;
@@ -266,18 +337,21 @@ void loop() {
   // — drops to the steady dim glow — but keeps state == S_PERM so the info stays.
   // Gated on alarmArmed (not a bare timestamp) so it can ONLY fire against a timer
   // that armAlarm() actually started this alarm — never a stale/zero start value.
-  if (alarmArmed && (millis() - alarmStart) > PERM_TIMEOUT_MS) {
+  if (alarmArmed && (now - alarmStart) > PERM_TIMEOUT_MS) {
     calmAlarm();
     dirty = true;
   }
 
-  if (millis() - lastFlash > FLASH_MS) {
-    lastFlash = millis();
-    flashOn = !flashOn;
-    if (state == S_PERM && !ack) dirty = true;
-  }
+  // CONFIRM pulse phase: LED bright + screen inverted for the first half of each
+  // cycle. Both the LED (via ledLevel) and the OLED invert (via draw) read this
+  // same phase off the same `now`, so they blink in perfect lockstep. Redraw only
+  // on a phase edge (not every tick) to keep the invert flashing while idle.
+  permHigh = (state == S_PERM && !ack) &&
+             (((now - alarmStart) % PERM_BLINK_MS) < (PERM_BLINK_MS / 2));
+  if (permHigh != lastPermHigh) dirty = true;
+  lastPermHigh = permHigh;
 
-  applyLed();                       // LED refreshed every loop (breathing/blink)
+  applyLed(now);                    // LED refreshed every loop (breathing/blink)
   if (dirty) { draw(); dirty = false; }
   delay(LOOP_MS);
 }

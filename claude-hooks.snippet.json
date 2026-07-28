@@ -17,10 +17,7 @@
       { "matcher": "", "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh notify" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh done" } ] }
-    ],
-    "SessionStart": [
-      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh start" } ] }
+      { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh off" } ] }
     ],
     "SessionEnd": [
       { "hooks": [ { "type": "command", "async": true, "command": "/ABSOLUTE/PATH/TO/claude-status/hooks/claude-status.sh end" } ] }
