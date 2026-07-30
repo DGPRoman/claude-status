@@ -25,7 +25,19 @@
 # Design rule: never block or fail the Claude session — every path exits 0.
 
 EVENT="${1:-off}"
+
+# Optional config (written by `install.sh --wifi`): sets CLAUDE_STATUS_URL and
+# CLAUDE_STATUS_TOKEN so the hook talks to a networked device instead of serial.
+# Env vars still win (a shell export overrides the file).
+CONF="${CLAUDE_STATUS_CONF:-$HOME/.config/claude-status.conf}"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF" 2>/dev/null || true
+
 PORT="${CLAUDE_STATUS_PORT:-/dev/claude-status}"
+# Transport: if a URL is set we POST over HTTP (WiFi device); otherwise we write
+# the serial port. TOKEN, when set, is sent so the device can authenticate us.
+URL="${CLAUDE_STATUS_URL:-}"
+TOKEN="${CLAUDE_STATUS_TOKEN:-}"
 # Seconds until a silent session is treated as dead and pruned. Must exceed your
 # longest single tool call: a session's file mtime only advances on a hook event,
 # so a >TTL tool (big build, long test run) would otherwise be pruned mid-work.
@@ -122,10 +134,22 @@ if flock -w 2 9 2>/dev/null; then
   # the wire (the documented protocol; off draws no badge anyway, so it's cosmetic).
   [ "$bestp" -eq 0 ] && { best="off"; count=1; }
 
-  # Send to the device. `clocal` so open() never waits on carrier, and `timeout`
-  # so a hung/non-draining device can never block the hook (and thus the session)
-  # indefinitely. The device may be absent — that's fine.
-  if [ -e "$PORT" ]; then
+  # Send to the device. Every path is time-bounded and swallows errors so a
+  # missing/hung device can never block the hook (and thus the Claude session).
+  if [ -n "$URL" ]; then
+    # WiFi transport: POST "state|count" to the device's HTTP endpoint. mDNS name
+    # (claude-status.local) or a bare IP both work in $URL. `-m 1` caps the wait;
+    # the token (if set) goes as a query arg the firmware checks.
+    if command -v curl >/dev/null 2>&1; then
+      post="$URL"
+      [ -n "$TOKEN" ] && case "$URL" in *\?*) post="$URL&t=$TOKEN" ;; *) post="$URL?t=$TOKEN" ;; esac
+      # text/plain so the device reads the body verbatim (a urlencoded content-type
+      # would make its WebServer parse "work|1" as a form field instead).
+      curl -sS -m 1 -H 'Content-Type: text/plain' --data-binary "$best|$count" "$post" >/dev/null 2>&1 || true
+    fi
+  elif [ -e "$PORT" ]; then
+    # Serial transport. `clocal` so open() never waits on carrier, and `timeout`
+    # so a hung/non-draining device can never block us. The device may be absent.
     timeout 1 bash -c '
       stty -F "$1" -hupcl clocal 115200 raw 2>/dev/null || true
       printf "%s|%s\n" "$2" "$3" > "$1"
