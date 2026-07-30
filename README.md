@@ -50,14 +50,17 @@ in the native VSCode extension** (verified empirically). **`PostToolUse`** (→
 (Claude Code fires no dedicated event when a permission is answered).
 
 For `CONFIRM` the LED pulses and the OLED blinks a full-screen invert **in
-lockstep** — both driven by the same ~4 Hz phase, starting deterministically at
-the same instant the alert arms. The **BOOT** button (GPIO9) acknowledges it: the
-pulse calms to a steady dim glow — and **stays** calm. Identical status resends
-(which the aggregator emits whenever any session fires a hook) don't re-trigger it;
-only a genuinely new CONFIRM, or *more* sessions needing you, re-arms it. As a
-failsafe, a CONFIRM also **auto-calms after 60 s** (same steady dim, state
-preserved) so a missed clear-event — e.g. `Ctrl+C`, which fires no hook — can never
-leave the device blinking forever (`PERM_TIMEOUT_MS` in `src/main.cpp`).
+lockstep** — both driven by the same ~3.3 Hz phase (`PERM_BLINK_MS` in
+`src/main.cpp`), starting deterministically at the same instant the alert arms.
+It **blinks until you dismiss it** — there is deliberately no auto-calm timeout,
+so if you step away and miss the moment it is still blinking when you get back.
+The **BOOT** button (GPIO9) is what acknowledges it: the pulse calms to a steady
+dim glow (state stays `CONFIRM`, so the word remains) — and **stays** calm.
+Identical status resends (which the aggregator emits whenever any session fires a
+hook) don't re-trigger it; only a genuinely new CONFIRM, or *more* sessions
+needing you, re-arms it. Aside from BOOT, the only other thing that stops the
+blink is the host moving the device off `perm` (e.g. the approved tool running,
+which flips `perm→work`).
 
 \* `Notification` maps to `off`, **except** a *permission* message, which is
 **ignored**: `PermissionRequest` is the single source of truth for `CONFIRM`
@@ -155,9 +158,9 @@ Claude) when nobody is looking at the device:
 | `stat` / `status`        | the state header only (no framebuffer)                             |
 
 The header reports `state` (wire token + display word + enum), `count`, `ack`,
-`alarmArmed`, `alarm_rem`, `perm_high` (pulse phase), `panel` (ON / OFF-dark), `led_level`,
-`last_line`, `lines_rx`, and the firmware build timestamp. Debug commands never
-change what's displayed.
+`blinking` (`true (until BOOT)` while a CONFIRM is pulsing), `perm_high` (pulse
+phase), `panel` (ON / OFF-dark), `led_level`, `last_line`, `lines_rx`, and the
+firmware build timestamp. Debug commands never change what's displayed.
 
 Read a dump back (one shell invocation, so no hook perturbs the state mid-read):
 ```bash

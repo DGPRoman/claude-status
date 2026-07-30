@@ -52,18 +52,13 @@ static const int     LED_FREQ = 2000;       // Hz
 static const int     LED_BITS = 8;          // -> duty 0..255
 
 // ---- animation timing / levels (ms, 0..255) ------------------------------
-static const unsigned long PERM_BLINK_MS = 240;   // full CONFIRM pulse cycle (~4 Hz).
+static const unsigned long PERM_BLINK_MS = 300;   // full CONFIRM pulse cycle (~3.3 Hz).
                                                   // Drives BOTH the LED blink and the
                                                   // OLED invert, so they pulse in lockstep.
 static const uint8_t       PERM_ACK_LVL  = 40;    // dim glow after BOOT ack
 static const unsigned long WORK_BREATH_MS = 1800; // breathing cycle
 static const uint8_t       WORK_MIN_LVL  = 12;
 static const uint8_t       WORK_SPAN_LVL = 170;   // peak = MIN + SPAN
-static const unsigned long PERM_TIMEOUT_MS = 60000; // auto-calm a CONFIRM after this
-                                                  // long with no new attention, so a
-                                                  // missed clear-event (Ctrl+C, or the
-                                                  // dead VSCode Notification hook) can
-                                                  // never leave it blinking forever
 static const size_t        RX_MAX        = 120;   // serial line-buffer cap (protocol lines are short)
 static const unsigned long LOOP_MS       = 15;    // main-loop tick
 
@@ -83,9 +78,8 @@ static bool  ack       = false;           // BOOT pressed -> calm the alert
 static bool  permHigh  = false;           // current CONFIRM pulse phase (LED bright + screen inverted)
 static bool  lastPermHigh = false;        // previous tick's permHigh (to redraw only on an edge)
 static bool  oledOn    = true;            // OLED panel power (setPowerSave); off in the off state
-static unsigned long alarmStart = 0;       // millis() when the CURRENT active (un-acked) CONFIRM
-                                           // began; the pulse phase origin AND the auto-calm start
-static bool  alarmArmed = false;           // is a perm alarm currently counting toward calm?
+static unsigned long alarmStart = 0;       // millis() when the CURRENT CONFIRM began;
+                                           // the pulse phase origin (blink starts on its peak)
 static bool  lastBtn   = HIGH;
 static String rx;
 
@@ -142,23 +136,17 @@ static uint8_t ledLevel(State s, unsigned long now) {
 }
 
 // --- CONFIRM alarm control -------------------------------------------------
-// A single pair of helpers owns both `ack` and the auto-calm timer so they can
-// never drift out of sync (the earlier bug: two separate code paths set the
-// timestamp, and an identical-resend path skipped it, so the failsafe fired
-// against a stale start time and the LED calmed almost immediately).
-//
-// armAlarm(): start (or restart) an urgent, un-acked CONFIRM and its 60s timer.
-// calmAlarm(): stop the urgency (BOOT press or the failsafe) — steady dim glow.
+// armAlarm(): start (or restart) an urgent, un-acked CONFIRM. Records `now` as the
+//   pulse phase origin so the blink begins at its bright peak — every fresh CONFIRM
+//   starts in the same deterministic phase.
+// calmAlarm(): acknowledge the alert (BOOT press) — the blink stops and the LED
+//   settles to a steady dim glow, while state stays S_PERM so CONFIRM keeps showing.
 static void armAlarm(unsigned long now) {
   ack        = false;
-  alarmArmed = true;
-  alarmStart = now;                 // also the pulse phase origin: the blink starts
-                                    // at its bright peak here, so every fresh CONFIRM
-                                    // begins in the same deterministic phase.
+  alarmStart = now;
 }
 static void calmAlarm() {
   ack        = true;
-  alarmArmed = false;
 }
 
 static void applyLed(unsigned long now) {
@@ -231,12 +219,7 @@ static void printDebug(bool withFrame) {
   Serial.print(F(" enum="));            Serial.println((int)state);
   Serial.print(F("count     : ")); Serial.println(sessCount);
   Serial.print(F("ack       : ")); Serial.println(ack ? F("true") : F("false"));
-  Serial.print(F("alarmArmed: ")); Serial.println(alarmArmed ? F("true") : F("false"));
-  if (alarmArmed) {
-    long rem = (long)PERM_TIMEOUT_MS - (long)(now - alarmStart);
-    Serial.print(F("alarm_rem : ")); Serial.print(rem < 0 ? 0 : rem);
-    Serial.println(F(" ms"));
-  }
+  Serial.print(F("blinking  : ")); Serial.println((state == S_PERM && !ack) ? F("true (until BOOT)") : F("false"));
   Serial.print(F("perm_high : ")); Serial.println(permHigh ? F("true") : F("false"));
   Serial.print(F("panel     : ")); Serial.println(oledOn ? F("ON") : F("OFF (physically dark)"));
   Serial.print(F("led_level : ")); Serial.println(ledLevel(state, now));
@@ -325,14 +308,13 @@ static void handleLine(String line) {
 
   state = newState;
   sessCount = newCount;
-  if (newState == S_PERM) {
-    // Genuinely new attention (state change, or more sessions) (re)arms the alarm
-    // AND restarts its auto-calm timer. A non-re-arm change into/within perm (e.g.
-    // a count DECREASE) leaves an existing ack untouched — nothing new needs you.
-    if (reArm) armAlarm(millis());
-  } else {
-    // Left CONFIRM entirely: drop any pending alarm so it can't linger or re-fire.
-    alarmArmed = false;
+  if (newState == S_PERM && reArm) {
+    // Genuinely new attention (state change, or more sessions) (re)arms the alarm:
+    // drops any BOOT ack and restarts the blink on its bright peak. A non-re-arm
+    // change within perm (e.g. a count DECREASE) leaves an existing ack untouched —
+    // nothing new needs you. Leaving perm needs no cleanup: ledLevel/permHigh both
+    // gate on state, so a non-perm state simply never blinks.
+    armAlarm(millis());
   }
   dirty = true;                // always redraw (the badge count may have changed)
 }
@@ -597,16 +579,11 @@ void loop() {
   if ((btn == LOW && (now - btnDownAt) >= PORTAL_HOLD_MS) || portalPending) startPortal();
 #endif
 
-  // Failsafe: auto-calm a CONFIRM that has been screaming too long. A missed
-  // clear-event (Ctrl+C fires no hook; the VSCode Notification hook is dead) must
-  // never strand the device in a forever-blink. This does what a BOOT press would
-  // — drops to the steady dim glow — but keeps state == S_PERM so the info stays.
-  // Gated on alarmArmed (not a bare timestamp) so it can ONLY fire against a timer
-  // that armAlarm() actually started this alarm — never a stale/zero start value.
-  if (alarmArmed && (now - alarmStart) > PERM_TIMEOUT_MS) {
-    calmAlarm();
-    dirty = true;
-  }
+  // A CONFIRM blinks until YOU dismiss it — there is deliberately NO auto-calm
+  // timeout. If you step away and miss the moment, it must still be blinking when
+  // you get back; only a BOOT press (or the host changing the state) stops it.
+  // That's the whole point of the alert. (alarmStart still exists purely as the
+  // blink's phase origin, so a fresh CONFIRM starts on the bright peak.)
 
   // CONFIRM pulse phase: LED bright + screen inverted for the first half of each
   // cycle. Both the LED (via ledLevel) and the OLED invert (via draw) read this
